@@ -1,11 +1,7 @@
+from typing import List
+
 import torch
-from diffusers import (
-    AutoencoderKL,
-    LMSDiscreteScheduler,
-    PNDMScheduler,
-    StableDiffusionPipeline,
-    UNet2DConditionModel,
-)
+from diffusers import AutoencoderKL, LMSDiscreteScheduler, UNet2DConditionModel
 from PIL import Image
 from torch import autocast
 from tqdm.auto import tqdm
@@ -18,8 +14,33 @@ https://colab.research.google.com/github/huggingface/notebooks/blob/main/diffuse
 
 
 class StableDiffusion:
-    def __init__(self):
+    """
+    Currently is tied pretty heavily to the official Stable Diffusion implementation. The goal is to
+    untie it to be more customizable but maybe in a different class.
+
+    The VAE and UNet will only work with versions of 'CompVis/stable-diffusion-v1-x'. The tokenizer and
+    text encoder currently use CLIP and haven't been tested on any other encoders.
+
+    Support for the different schedulers is planned.
+    """
+
+    def __init__(
+        self,
+        vae_name: str = "CompVis/stable-diffusion-v1-4",
+        tokenizer_name: str = "openai/clip-vit-large-patch14",
+        text_encoder_name: str = "openai/clip-vit-large-patch14",
+        unet_name: str = "CompVis/stable-diffusion-v1-4",
+        scheduler_name: str = "lmsd",
+    ):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.vae_name = vae_name
+        self.tokenizer_name = tokenizer_name
+        self.text_encoder_name = text_encoder_name
+        self.unet_name = unet_name
+
+        self.scheduler_key = {"lmsd": LMSDiscreteScheduler}
+        self.scheduler_name = scheduler_name
+
         self.vae = None
         self.tokenizer = None
         self.text_encoder = None
@@ -30,25 +51,24 @@ class StableDiffusion:
     def init_model(self):
         # 1. Load the autoencoder model which will be used to decode the latents into image space.
         self.vae = AutoencoderKL.from_pretrained(
-            "CompVis/stable-diffusion-v1-4",
+            self.vae_name,
             subfolder="vae",
             use_auth_token=True,
         )
 
         # 2. Load the tokenizer and text encoder to tokenize and encode the text.
-        self.tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14")
-        self.text_encoder = CLIPTextModel.from_pretrained(
-            "openai/clip-vit-large-patch14"
-        )
+        self.tokenizer = CLIPTokenizer.from_pretrained(self.tokenizer_name)
+        self.text_encoder = CLIPTextModel.from_pretrained(self.text_encoder_name)
 
         # 3. The UNet model for generating the latents.
         self.unet = UNet2DConditionModel.from_pretrained(
-            "CompVis/stable-diffusion-v1-4",
+            self.unet_name,
             subfolder="unet",
             use_auth_token=True,
         )
 
-        self.scheduler = LMSDiscreteScheduler(
+        # TODO: Generalize this to work with the other schedulers
+        self.scheduler = self.scheduler_key[self.scheduler_name](
             beta_start=0.00085,
             beta_end=0.012,
             beta_schedule="scaled_linear",
@@ -59,15 +79,35 @@ class StableDiffusion:
         self.text_encoder = self.text_encoder.to(self.device)
         self.unet = self.unet.to(self.device)
 
+    def save_mosaic(self, images: List, name: str, cols: int, rows: int):
+        w, h = images[0].size
+        grid = Image.new("RGB", size=(cols * w, rows * h))
+        grid_w, grid_h = grid.size
+
+        for i, img in enumerate(images):
+            grid.paste(img, box=(i % cols * w, i // cols * h))
+
+        grid.save(f"{name}.jpg")
+        return grid
+
     def save(self, image, name: str):
+        # breakpoint()
         image = (image / 2 + 0.5).clamp(0, 1)
         image = image.detach().cpu().permute(0, 2, 3, 1).numpy()
         images = (image * 255).round().astype("uint8")
         fn = name.replace(" ", "_")
-        pil_images = [
-            Image.fromarray(image).save(f"{fn}-{i}.jpg")
-            for i, image in enumerate(images)
-        ]
+        pil_images = [Image.fromarray(image) for image in images]
+        if len(pil_images) > 1:
+            if len(pil_images) < 4:
+                rows = 1
+                cols = len(pil_images)
+            else:
+                cols = len(pil_images) // 2
+                rows = len(pil_images) - cols
+            self.save_mosaic(images, fn, cols, rows)
+        else:
+            pil_images[0].save(f"{fn}.jpg")
+
         return pil_images
 
     def __call__(
@@ -82,7 +122,7 @@ class StableDiffusion:
     ):
         generator = torch.manual_seed(generator_seed)
         text_input = self.tokenizer(
-            [prompt],
+            [prompt] * batch_size,
             padding="max_length",
             max_length=self.tokenizer.model_max_length,
             truncation=True,
@@ -124,6 +164,7 @@ class StableDiffusion:
                     noise_pred = self.unet(
                         latent_model_input, t, encoder_hidden_states=text_embeddings
                     )["sample"]
+                # breakpoint()
 
                 # perform guidance
                 noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
@@ -144,21 +185,44 @@ class StableDiffusion:
 
 
 if __name__ == "__main__":
-    prompt = "a painting of a cozy candlelit brewery in the winter"
-
-    height = 512  # default height of Stable Diffusion
-    width = 512  # default width of Stable Diffusion
-
-    num_inference_steps = 100  # Number of denoising steps
-
-    guidance_scale = 7.5  # Scale for classifier-free guidance
-
-    generator = torch.manual_seed(
-        32
-    )  # Seed generator to create the inital latent noise
-
-    batch_size = 1
     sd = StableDiffusion()
-    images = sd(prompt=prompt)
-    sd.save(images, prompt)
-    breakpoint()
+    keywords = ["photo", "photograph", "painting", "image"]
+    while True:
+        print(
+            "Enter the text you would like to generate. If you want to exit, use CTRL+C or type 'exit'"
+        )
+        prompt = input("Text: ")
+        if prompt.lower() == "exit":
+            break
+        steps = input("Enter number of steps or leave blank for default (51): ")
+        seed = input("Enter the generator seed or leave blank for default (32): ")
+
+        if not steps:
+            steps = 51
+        else:
+            steps = int(steps)
+
+        if not seed:
+            seed = 32
+        else:
+            seed = int(seed)
+
+        keys = []
+        for keyword in keywords:
+            if keyword not in prompt:
+                keys.append(0)
+            else:
+                keys.append(1)
+        if sum(keys) == 0:
+            prompt = f"a photo of {prompt}"
+
+        print(f"Generating image from prompt: {prompt}")
+        sd.save(
+            sd(
+                prompt=prompt,
+                num_inference_steps=51,
+                batch_size=1,
+                generator_seed=seed,
+            ),
+            prompt,
+        )
